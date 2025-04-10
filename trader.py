@@ -10,90 +10,134 @@ class Trader:
             "RAINFOREST_RESIN": {
                 "position_limit": 50,
                 "fair_value": 10000,  # Stable value
-                "spread": 2
+                "spread": 2,
+                "min_edge": 1  # Minimum edge required to trade
             },
             "KELP": {
                 "position_limit": 50,
                 "fair_value": None,  # Dynamic value
-                "spread": 4
+                "spread": 3,
+                "momentum_window": 5,  # Window for momentum calculation
+                "volatility_window": 20,  # Window for volatility calculation
+                "min_edge": 2  # Minimum edge required to trade
             },
             "SQUID_INK": {
                 "position_limit": 50,
                 "fair_value": None,  # Dynamic value
-                "spread": 6,  # Wider spread due to volatility
-                "mean_reversion_window": 10,  # Window for mean reversion
-                "std_dev_threshold": 2.0  # Number of std devs for mean reversion signals
+                "spread": 5,  # Wider spread due to volatility
+                "mean_reversion_window": 15,  # Window for mean reversion
+                "std_dev_threshold": 1.5,  # Number of std devs for mean reversion signals
+                "min_edge": 3  # Minimum edge required to trade
             }
         }
         self.historical_prices = {}
-        self.ema_short = {}  # Short-term exponential moving average
-        self.ema_long = {}   # Long-term exponential average
+        self.volatility = {}  # Track volatility per product
+        self.momentum = {}    # Track momentum per product
         
-    def calculate_fair_value(self, product: str, order_depth: OrderDepth, market_trades: List) -> float:
-        """Calculate fair value using weighted average of market trades and mid price"""
-        # Get mid price from order book
-        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
+    def calculate_fair_value(self, product: str, order_depth: OrderDepth) -> float:
+        """Calculate fair value using order book data"""
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return self.product_parameters[product]["fair_value"]
+            
+        # Calculate volume-weighted average prices
+        total_bid_volume = 0
+        total_bid_value = 0
+        total_ask_volume = 0
+        total_ask_value = 0
         
-        if best_bid and best_ask:
-            mid_price = (best_bid + best_ask) / 2
+        for price, volume in order_depth.buy_orders.items():
+            total_bid_volume += abs(volume)
+            total_bid_value += price * abs(volume)
+            
+        for price, volume in order_depth.sell_orders.items():
+            total_ask_volume += abs(volume)
+            total_ask_value += price * abs(volume)
+            
+        # Calculate VWAPs
+        bid_vwap = total_bid_value / total_bid_volume if total_bid_volume > 0 else None
+        ask_vwap = total_ask_value / total_ask_volume if total_ask_volume > 0 else None
+        
+        if bid_vwap and ask_vwap:
+            # Weight more towards the side with more volume
+            total_volume = total_bid_volume + total_ask_volume
+            bid_weight = total_bid_volume / total_volume
+            ask_weight = total_ask_volume / total_volume
+            return (bid_vwap * bid_weight) + (ask_vwap * ask_weight)
+        elif bid_vwap:
+            return bid_vwap
+        elif ask_vwap:
+            return ask_vwap
         else:
-            mid_price = self.product_parameters[product]["fair_value"]
-            
-        # Calculate VWAP from recent trades
-        if market_trades and len(market_trades) > 0:
-            total_volume = sum(abs(trade.quantity) for trade in market_trades)
-            vwap = sum(trade.price * abs(trade.quantity) for trade in market_trades) / total_volume
-            
-            # Combine VWAP and mid price with weights
-            if mid_price:
-                fair_value = (vwap * 0.7) + (mid_price * 0.3)
-            else:
-                fair_value = vwap
-        else:
-            fair_value = mid_price if mid_price else self.product_parameters[product]["fair_value"]
-            
-        return fair_value
+            return self.product_parameters[product]["fair_value"]
 
-    def update_ema(self, product: str, price: float, short_period=9, long_period=21):
-        """Update exponential moving averages"""
-        if product not in self.ema_short:
-            self.ema_short[product] = price
-            self.ema_long[product] = price
-        else:
-            # Update EMAs
-            self.ema_short[product] = (price * (2 / (short_period + 1))) + (self.ema_short[product] * (1 - (2 / (short_period + 1))))
-            self.ema_long[product] = (price * (2 / (long_period + 1))) + (self.ema_long[product] * (1 - (2 / (long_period + 1))))
+    def update_market_metrics(self, product: str, price: float):
+        """Update market metrics (volatility, momentum) for the product"""
+        if product not in self.historical_prices:
+            self.historical_prices[product] = []
+        self.historical_prices[product].append(price)
+        
+        # Update volatility
+        window = self.product_parameters[product].get("volatility_window", 20)
+        if len(self.historical_prices[product]) >= window:
+            recent_prices = self.historical_prices[product][-window:]
+            self.volatility[product] = statistics.stdev(recent_prices)
+        
+        # Update momentum
+        window = self.product_parameters[product].get("momentum_window", 5)
+        if len(self.historical_prices[product]) >= window:
+            recent_prices = self.historical_prices[product][-window:]
+            self.momentum[product] = (recent_prices[-1] - recent_prices[0]) / recent_prices[0]
 
-    def get_order_volume(self, product: str, position: int, side: str) -> int:
-        """Calculate order volume respecting position limits"""
+    def get_order_volume(self, product: str, position: int, side: str, available_volume: int) -> int:
+        """Calculate order volume with improved risk management"""
         position_limit = self.product_parameters[product]["position_limit"]
         
+        # Base volume on current position and available market volume
         if side == "BUY":
-            return min(position_limit - position, 10)  # Don't take full position at once
+            max_position = position_limit - position
+            # Scale order size based on volatility if available
+            if product in self.volatility:
+                vol_scale = max(0.2, 1 - self.volatility[product] / 100)  # Reduce size in high volatility
+            else:
+                vol_scale = 0.5
+                
+            base_volume = min(max_position, available_volume, round(5 * vol_scale))
+            
+            # Further reduce size if near position limit
+            position_scale = 1 - (abs(position) / position_limit)
+            return max(1, round(base_volume * position_scale))
         else:  # SELL
-            return min(position_limit + position, 10)  # Don't take full position at once
+            max_position = position_limit + position
+            if product in self.volatility:
+                vol_scale = max(0.2, 1 - self.volatility[product] / 100)
+            else:
+                vol_scale = 0.5
+                
+            base_volume = min(max_position, available_volume, round(5 * vol_scale))
+            position_scale = 1 - (abs(position) / position_limit)
+            return max(1, round(base_volume * position_scale))
 
     def check_mean_reversion_signal(self, product: str, current_price: float) -> str:
         """Check for mean reversion signals for SQUID_INK"""
-        if product != "SQUID_INK" or not self.historical_prices.get(product):
+        if not self.historical_prices.get(product):
             return None
             
         window = self.product_parameters[product]["mean_reversion_window"]
         threshold = self.product_parameters[product]["std_dev_threshold"]
         
-        # Get recent prices
-        recent_prices = self.historical_prices[product][-window:]
-        if len(recent_prices) < window:
+        if len(self.historical_prices[product]) < window:
             return None
             
+        recent_prices = self.historical_prices[product][-window:]
         mean = statistics.mean(recent_prices)
         std_dev = statistics.stdev(recent_prices)
         
-        # Calculate z-score
-        z_score = (current_price - mean) / std_dev if std_dev > 0 else 0
+        if std_dev == 0:
+            return None
+            
+        z_score = (current_price - mean) / std_dev
         
-        # Generate signals based on deviation
+        # Reversed signals from previous version
         if z_score > threshold:
             return "SELL"  # Price is too high, expect reversion down
         elif z_score < -threshold:
@@ -102,95 +146,110 @@ class Trader:
         return None
 
     def run(self, state: TradingState):
-        """
-        Main trading logic
-        """
+        """Main trading logic"""
         result = {product: [] for product in state.order_depths.keys()}
         
         # Restore state if exists
         if state.traderData != "":
             saved_state = jsonpickle.decode(state.traderData)
             self.historical_prices = saved_state["historical_prices"]
-            self.ema_short = saved_state["ema_short"]
-            self.ema_long = saved_state["ema_long"]
+            self.volatility = saved_state.get("volatility", {})
+            self.momentum = saved_state.get("momentum", {})
             
         for product in state.order_depths:
-            if product not in state.order_depths:
-                continue
-                
             order_depth = state.order_depths[product]
             orders: List[Order] = []
-            
-            # Calculate fair value
-            fair_value = self.calculate_fair_value(
-                product, 
-                order_depth,
-                state.market_trades.get(product, [])
-            )
-            
-            # Update EMAs and historical prices
-            if fair_value:
-                self.update_ema(product, fair_value)
-                if product not in self.historical_prices:
-                    self.historical_prices[product] = []
-                self.historical_prices[product].append(fair_value)
-            
             position = state.position.get(product, 0)
-            spread = self.product_parameters[product]["spread"]
             
-            # Different strategies per product
+            # Skip if no orders on either side
+            if not order_depth.buy_orders and not order_depth.sell_orders:
+                continue
+                
+            # Calculate fair value and update metrics
+            fair_value = self.calculate_fair_value(product, order_depth)
+            if fair_value:
+                self.update_market_metrics(product, fair_value)
+            
+            spread = self.product_parameters[product]["spread"]
+            min_edge = self.product_parameters[product]["min_edge"]
+            
             if product == "RAINFOREST_RESIN":
-                # Simple market making for stable product
+                # Market making with dynamic spread based on position
+                position_factor = abs(position) / self.product_parameters[product]["position_limit"]
+                adjusted_spread = spread + (spread * position_factor)  # Wider spread when position is large
+                
                 if len(order_depth.sell_orders) > 0:
                     best_ask = min(order_depth.sell_orders.keys())
-                    if best_ask < fair_value - spread:
-                        buy_volume = self.get_order_volume(product, position, "BUY")
-                        orders.append(Order(product, best_ask, buy_volume))
+                    if best_ask < fair_value - adjusted_spread:
+                        available_volume = abs(order_depth.sell_orders[best_ask])
+                        buy_volume = self.get_order_volume(product, position, "BUY", available_volume)
+                        if buy_volume > 0:
+                            orders.append(Order(product, best_ask, buy_volume))
 
                 if len(order_depth.buy_orders) > 0:
                     best_bid = max(order_depth.buy_orders.keys())
-                    if best_bid > fair_value + spread:
-                        sell_volume = self.get_order_volume(product, position, "SELL")
-                        orders.append(Order(product, best_bid, -sell_volume))
+                    if best_bid > fair_value + adjusted_spread:
+                        available_volume = abs(order_depth.buy_orders[best_bid])
+                        sell_volume = self.get_order_volume(product, position, "SELL", available_volume)
+                        if sell_volume > 0:
+                            orders.append(Order(product, best_bid, -sell_volume))
                         
             elif product == "KELP":
-                # Trend following strategy
-                if product in self.ema_short and product in self.ema_long:
-                    # Buy on uptrend
-                    if self.ema_short[product] > self.ema_long[product] and position < self.product_parameters[product]["position_limit"]:
+                # Combine momentum and mean reversion for KELP
+                if product in self.momentum:
+                    momentum_signal = self.momentum[product]
+                    
+                    if momentum_signal > 0.01 and position < self.product_parameters[product]["position_limit"]:
+                        # Strong upward momentum - buy
                         if len(order_depth.sell_orders) > 0:
                             best_ask = min(order_depth.sell_orders.keys())
-                            buy_volume = self.get_order_volume(product, position, "BUY")
-                            orders.append(Order(product, best_ask, buy_volume))
+                            if best_ask < fair_value + min_edge:  # Ensure minimum edge
+                                available_volume = abs(order_depth.sell_orders[best_ask])
+                                buy_volume = self.get_order_volume(product, position, "BUY", available_volume)
+                                if buy_volume > 0:
+                                    orders.append(Order(product, best_ask, buy_volume))
                     
-                    # Sell on downtrend
-                    elif self.ema_short[product] < self.ema_long[product] and position > -self.product_parameters[product]["position_limit"]:
+                    elif momentum_signal < -0.01 and position > -self.product_parameters[product]["position_limit"]:
+                        # Strong downward momentum - sell
                         if len(order_depth.buy_orders) > 0:
                             best_bid = max(order_depth.buy_orders.keys())
-                            sell_volume = self.get_order_volume(product, position, "SELL")
-                            orders.append(Order(product, best_bid, -sell_volume))
+                            if best_bid > fair_value - min_edge:  # Ensure minimum edge
+                                available_volume = abs(order_depth.buy_orders[best_bid])
+                                sell_volume = self.get_order_volume(product, position, "SELL", available_volume)
+                                if sell_volume > 0:
+                                    orders.append(Order(product, best_bid, -sell_volume))
                             
             elif product == "SQUID_INK":
-                # Mean reversion strategy
+                # Pure mean reversion for SQUID_INK with strict risk management
                 signal = self.check_mean_reversion_signal(product, fair_value)
                 
-                if signal == "BUY" and len(order_depth.sell_orders) > 0:
-                    best_ask = min(order_depth.sell_orders.keys())
-                    buy_volume = self.get_order_volume(product, position, "BUY")
-                    orders.append(Order(product, best_ask, buy_volume))
-                    
-                elif signal == "SELL" and len(order_depth.buy_orders) > 0:
-                    best_bid = max(order_depth.buy_orders.keys())
-                    sell_volume = self.get_order_volume(product, position, "SELL")
-                    orders.append(Order(product, best_bid, -sell_volume))
+                # Only trade if volatility is within acceptable range
+                acceptable_volatility = not self.volatility.get(product) or self.volatility[product] < 100
+                
+                if acceptable_volatility:
+                    if signal == "BUY" and len(order_depth.sell_orders) > 0:
+                        best_ask = min(order_depth.sell_orders.keys())
+                        if best_ask < fair_value + min_edge:  # Ensure minimum edge
+                            available_volume = abs(order_depth.sell_orders[best_ask])
+                            buy_volume = self.get_order_volume(product, position, "BUY", available_volume)
+                            if buy_volume > 0:
+                                orders.append(Order(product, best_ask, buy_volume))
+                        
+                    elif signal == "SELL" and len(order_depth.buy_orders) > 0:
+                        best_bid = max(order_depth.buy_orders.keys())
+                        if best_bid > fair_value - min_edge:  # Ensure minimum edge
+                            available_volume = abs(order_depth.buy_orders[best_bid])
+                            sell_volume = self.get_order_volume(product, position, "SELL", available_volume)
+                            if sell_volume > 0:
+                                orders.append(Order(product, best_bid, -sell_volume))
             
             result[product] = orders
 
         # Save state
         state_to_save = {
             "historical_prices": self.historical_prices,
-            "ema_short": self.ema_short,
-            "ema_long": self.ema_long
+            "volatility": self.volatility,
+            "momentum": self.momentum
         }
         
         return result, 0, jsonpickle.encode(state_to_save) 
